@@ -1,0 +1,727 @@
+---
+title: "Multiorgan_Cx3cr1"
+output: html_document
+date: "2025-10-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+# # ==== CHUNK 1: Setup + helpers + read & merge raw 10x matrices ====
+suppressPackageStartupMessages({
+  library(Seurat); library(Matrix); library(dplyr); library(ggplot2)
+  library(data.table); library(future)
+})
+
+## Parallel defaults (toggle sequential where needed later)
+if (.Platform$OS.type == "windows") {
+  plan(multisession, workers = 24)
+} else {
+  plan(multicore, workers = 48)
+}
+options(future.globals.maxSize = 1000e9)
+data.table::setDTthreads( min(15, parallel::detectCores()) )
+
+## Paths
+BASE   <- "D:/organs/mouse"
+OUTDIR <- file.path(BASE,"filtered", "rds");        dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+PLOTD  <- file.path(BASE,"filtered",  "plots_new");      dir.create(PLOTD, showWarnings = FALSE, recursive = TRUE)
+DETD   <- file.path(BASE,"filtered",  "deg_tables_New"); dir.create(DETD, showWarnings = FALSE, recursive = TRUE)
+HMD    <- file.path(BASE,"filtered",  "heatmap_inputs"); dir.create(HMD, showWarnings = FALSE, recursive = TRUE)
+
+org_paths <- c(
+  Heart    = file.path(BASE, "heart"),
+  Lung     = file.path(BASE, "lungs"),
+  Kidney   = file.path(BASE, "kidneys"),
+  Liver    = file.path(BASE, "liver"),
+  Brain    = file.path(BASE, "brain"),
+  Pancreas = file.path(BASE, "pancreas")
+)
+print(org_paths)
+
+## Helpers to find/read flexible MTX/10x folders
+first_match <- function(path, patterns){
+  f_full <- list.files(path, full.names = TRUE)
+  f_base <- basename(f_full)
+  for (p in patterns) {
+    hit <- which(grepl(p, f_base, ignore.case = TRUE))
+    if (length(hit)) return(f_full[hit[1]])
+  }
+  NA_character_
+}
+
+read_10x_any <- function(dir_path){
+  m <- tryCatch(Read10X(dir_path), error = function(e) NULL)
+  if (!is.null(m)) return(m)
+  mtx  <- first_match(dir_path, c("^matrix\\.mtx(\\.gz)?$"))
+  feat <- first_match(dir_path, c("^(features|genes)\\.(tsv|txt)(\\.gz)?$"))
+  bc   <- first_match(dir_path, c("^barcodes\\.(tsv|txt)(\\.gz)?$"))
+  if (any(is.na(c(mtx, feat, bc)))) {
+    stop("Missing matrix/feature/barcode files in: ", dir_path,
+         "\nFiles:\n", paste(list.files(dir_path), collapse = "\n"))
+  }
+  ReadMtx(mtx = mtx, features = feat, cells = bc)
+}
+
+## Harmonize gene names and rebuild object to collapse duplicates
+harmonize_and_rebuild <- function(obj, assay = "RNA") {
+  M <- tryCatch(GetAssayData(obj, assay = assay, layer = "counts"),
+                error = function(e) LayerData(obj, assay = assay, layer = "counts"))
+  stopifnot(inherits(M, "dgCMatrix"))
+  g_orig  <- rownames(M)
+  g_clean <- trimws(sub("\\.\\d+$", "", g_orig))
+  f <- factor(g_clean, levels = unique(g_clean))
+  if (nlevels(f) < length(g_clean)) {
+    S <- sparseMatrix(i = seq_along(g_clean), j = as.integer(f),
+                      x = 1, dims = c(length(g_clean), nlevels(f)))
+    M <- Matrix::t(S) %*% M
+    rownames(M) <- levels(f)
+  } else {
+    rownames(M) <- g_clean
+  }
+  meta <- obj@meta.data
+  stopifnot(identical(rownames(meta), colnames(M)))
+  new_obj <- CreateSeuratObject(M, project = obj@project.name,
+                                meta.data = meta, min.cells = 0, min.features = 0)
+  new_obj$organ   <- obj$organ
+  new_obj$dataset <- obj$dataset
+  new_obj$tech    <- obj$tech
+  new_obj
+}
+
+## Read, tag, harmonize, merge
+org_objs <- lapply(names(org_paths), function(nm){
+  counts <- read_10x_any(org_paths[[nm]])
+  o <- CreateSeuratObject(counts, project = nm)
+  o$organ <- nm; o$dataset <- "merged_organs"; o$tech <- "10x/MTX"
+  o
+})
+names(org_objs) <- names(org_paths)
+org_objs <- lapply(org_objs, harmonize_and_rebuild)
+
+merged <- Reduce(function(a,b) merge(a,b), org_objs)
+saveRDS(merged, file.path(OUTDIR, "seurat_merged_raw.rds"))
+cat("Merged dims:", nrow(merged), "genes x", ncol(merged), "cells\n")
+print(table(merged$organ))
+
+
+```
+
+Chunk 2 — QC filtering (no CD45 gating)
+
+Purpose: Compute %MT, remove low-quality/outlier cells using global thresholds, save QC-ed object, and export a QC violin plot per organ.
+Inputs: rds/seurat_merged_raw.rds.
+Outputs: rds/seurat_post_qc.rds, plots/QC_violins_by_organ_post_filter.png.
+Notes: Thresholds are mean ± 3 SD for nCount_RNA/nFeature_RNA, and percent.mt < 5.
+
+```{r}
+# ==== CHUNK 2A: Robust per-organ QC (MAD-based) ====
+suppressPackageStartupMessages({ library(Seurat); library(dplyr) })
+
+BASE   <- "D:/organs/mouse"
+OUTDIR <- file.path(BASE,"filtered", "rds")
+PLOTD  <- file.path(BASE,"filtered", "plots_new"); dir.create(PLOTD, showWarnings = FALSE, recursive = TRUE)
+
+merged <- readRDS(file.path(OUTDIR, "seurat_merged_raw.rds"))
+
+# %mt (mouse 'mt-')
+if (!"percent.mt" %in% colnames(merged@meta.data)) {
+  merged[["percent.mt"]] <- PercentageFeatureSet(merged, pattern = "^mt-")
+}
+
+# Split by organ for organ-specific QC
+objs <- SplitObject(merged, split.by = "organ")
+
+filter_one <- function(x) {
+  md <- x@meta.data
+
+  # Robust stats
+  med_g <- median(md$nFeature_RNA, na.rm = TRUE); mad_g <- mad(md$nFeature_RNA, na.rm = TRUE)
+  med_u <- median(md$nCount_RNA,   na.rm = TRUE); mad_u <- mad(md$nCount_RNA,   na.rm = TRUE)
+
+  # Lower bounds (robust) — never below practical floors
+  min_genes <- max(300, floor(med_g - 4*mad_g))
+  min_umis  <- max(500, floor(med_u - 4*mad_u))
+
+  # Adaptive mt cap: 95th percentile, clamped to [10, 20]
+  mt95  <- as.numeric(quantile(md$percent.mt, 0.95, na.rm = TRUE))
+  max_mt <- min(20, max(10, round(mt95)))
+
+  keep <- with(md,
+    percent.mt   < max_mt &
+    nFeature_RNA >= min_genes &
+    nCount_RNA   >= min_umis
+  )
+
+  message(sprintf("[%s] QC keep: %d / %d (mt<%d%%, genes>=%d, UMIs>=%d)",
+                  unique(x$organ), sum(keep), nrow(md), max_mt, min_genes, min_umis))
+  subset(x, cells = rownames(md)[keep])
+}
+
+objs_qc <- lapply(objs, filter_one)
+obj_qc0 <- Reduce(function(a,b) merge(a,b), objs_qc)
+
+cat("Post-QC (pre-doublet) dims:", nrow(obj_qc0), "genes x", ncol(obj_qc0), "cells\n")
+
+
+```
+Chunk 3 — Integration (SCT per-organ + RPCA), UMAP & clusters
+
+Purpose: SCTransform each organ, integrate with RPCA, compute PCA/UMAP, and cluster.
+Inputs: rds/seurat_post_qc.rds.
+Outputs: rds/integrated_SCT_RPCA_baseline-postcluster.rds, plots/umap_integrated_by_organ.png, plots/umap_integrated_by_cluster.png.
+Notes: Heavy steps run in with_sequential() to avoid Windows future shipping issues. dims_use = 1:20 (adjust after checking elbow).
+
+
+```{r}
+# ==== CHUNK 2B: Doublet detection (scDblFinder if available; else soft upper caps) ====
+USE_DOUBLETS <- TRUE  # set FALSE to skip
+
+if (USE_DOUBLETS) {
+  dbl_ok <- requireNamespace("scDblFinder", quietly = TRUE)
+  if (!dbl_ok) warning("Package 'scDblFinder' not found; falling back to soft upper caps.")
+} else {
+  dbl_ok <- FALSE
+}
+
+if (dbl_ok) {
+  suppressPackageStartupMessages(library(scDblFinder))
+  # Run per-organ to respect organ-specific doublet rates
+  objs_qc_dbl <- SplitObject(obj_qc0, split.by = "organ")
+  objs_qc_dbl <- lapply(objs_qc_dbl, function(x){
+    x <- scDblFinder::scDblFinder(x, samples = NULL, cores = 1)
+    subset(x, cells = colnames(x)[x$scDblFinder.class != "doublet"])
+  })
+  obj_qc <- Reduce(function(a,b) merge(a,b), objs_qc_dbl)
+  cat("After doublet removal:", ncol(obj_qc), "cells\n")
+} else {
+  # Soft upper caps (median + 5*MAD) if doublet tool isn’t available
+  md <- obj_qc0@meta.data
+  by_org <- split(seq_len(nrow(md)), obj_qc0$organ)
+  keep_soft <- rep(TRUE, nrow(md))
+
+  for (org in names(by_org)) {
+    idx <- by_org[[org]]
+    g <- md$nFeature_RNA[idx]; u <- md$nCount_RNA[idx]
+    max_genes <- median(g, na.rm=TRUE) + 5*mad(g, na.rm=TRUE)
+    max_umis  <- median(u, na.rm=TRUE) + 5*mad(u, na.rm=TRUE)
+    keep_soft[idx] <- keep_soft[idx] & (g <= max_genes) & (u <= max_umis)
+    message(sprintf("[%s] Soft caps: nFeature<=%.0f, nCount<=%.0f (kept %d/%d)",
+                    org, max_genes, max_umis, sum(keep_soft[idx]), length(idx)))
+  }
+
+  obj_qc <- subset(obj_qc0, cells = rownames(md)[keep_soft])
+  cat("After soft-cap doublet filter:", ncol(obj_qc), "cells\n")
+}
+
+saveRDS(obj_qc, file.path(OUTDIR, "seurat_post_qc.rds"))
+cat("Saved:", file.path(OUTDIR, "seurat_post_qc.rds"), "\n")
+
+
+```
+
+Chunk 4 — Integration diagnostics (optional)
+
+Purpose: Inspect PCs, per-PC loadings, organ mixing, and silhouette scores.
+Inputs: obj.int from previous chunk.
+Outputs: Printed diagnostics; UMAP feature plot of neighborhood mixing.
+Notes: Helps verify integration quality (batch mixing ≈ high; cluster biology ≈ positive silhouettes).
+
+
+```{r}
+# ==== CHUNK 2C: QC violins by organ (optional) ====
+suppressPackageStartupMessages(library(ggplot2))
+DefaultAssay(obj_qc) <- "RNA"
+
+p_qc <- VlnPlot(
+  obj_qc,
+  features = c("nFeature_RNA","nCount_RNA","percent.mt"),
+  group.by = "organ", pt.size = 0, ncol = 3
+) + ggtitle("QC metrics by organ (post robust filtering)")
+
+ggsave(file.path(PLOTD, "QC_violins_by_organ_post_filter.png"),
+       p_qc, width = 14, height = 5.5, dpi = 300)
+
+cat("Cells per organ (post QC):\n")
+print(table(obj_qc$organ))
+
+
+```
+
+
+```{r}
+# ==== CHUNK 3: SCT per-organ, RPCA integration, UMAP + clusters ====
+suppressPackageStartupMessages({ library(Seurat); library(future); library(ggplot2) })
+
+BASE   <- "D:/organs/mouse"
+OUTDIR <- file.path(BASE,"filtered", "rds")
+PLOTD  <- file.path(BASE,"filtered", "plots_new"); dir.create(PLOTD, showWarnings = FALSE, recursive = TRUE)
+
+obj <- readRDS(file.path(OUTDIR, "seurat_post_qc.rds"))
+stopifnot("organ" %in% colnames(obj@meta.data))
+DefaultAssay(obj) <- "RNA"
+
+# helper: run sequential for heavy steps (Windows large globals)
+with_sequential <- function(expr) {
+  old <- future::plan(); on.exit(future::plan(old), add = TRUE)
+  future::plan(sequential)
+  eval.parent(substitute(expr))
+}
+
+# light parallel again for graph/UMAP
+if (.Platform$OS.type == "windows") plan(multisession, workers = 24) else plan(multicore, workers = 48)
+options(future.globals.maxSize = 32 * 1024^3)
+
+# split & SCTransform per organ
+obj.list <- SplitObject(obj, split.by = "organ")
+with_sequential({
+  obj.list <- lapply(
+    obj.list,
+    function(x) SCTransform(
+      x,
+      vst.flavor = "v2",
+      variable.features.n = 3000,
+      verbose = FALSE
+    )
+  )
+})
+
+# integration features & prep
+features <- SelectIntegrationFeatures(obj.list, nfeatures = 3000)
+with_sequential({
+  obj.list <- PrepSCTIntegration(obj.list, anchor.features = features, verbose = FALSE)
+})
+
+# PCA per split on these features (RPCA recommended)
+with_sequential({
+  obj.list <- lapply(obj.list, function(x) RunPCA(x, features = features, npcs = 30, verbose = FALSE))
+})
+
+# anchors
+anchors <- with_sequential({
+  FindIntegrationAnchors(
+    object.list          = obj.list,
+    normalization.method = "SCT",
+    reduction            = "rpca",
+    anchor.features      = features,
+    dims                 = 1:30,
+    verbose              = TRUE
+  )
+})
+
+# integrate
+obj.int <- with_sequential({
+  IntegrateData(anchorset = anchors, normalization.method = "SCT", verbose = TRUE)
+})
+
+# DR/clustering
+DefaultAssay(obj.int) <- "integrated"
+obj.int <- RunPCA(obj.int, npcs = 50, verbose = FALSE)
+
+# (Optional) elbow check; adjust dims_use after review
+ElbowPlot(obj.int, reduction = "pca", ndims = 50)
+dims_use <- 1:25
+
+obj.int <- FindNeighbors(obj.int, dims = dims_use, k.param = 50, verbose = FALSE)
+obj.int <- FindClusters(obj.int, resolution = 0.5, verbose = FALSE)
+
+set.seed(1234)
+obj.int <- RunUMAP(
+  obj.int, dims = dims_use,
+  n.neighbors = 80,
+  min.dist    = 0.45,
+  metric      = "cosine",
+  spread      = 1.3,
+  repulsion_strength = 1.5,
+  n.threads   = if (.Platform$OS.type == "windows") 24 else 48,
+  verbose     = FALSE
+)
+
+p_by_org <- DimPlot(obj.int, reduction = "umap", group.by = "organ", raster = TRUE, label = TRUE) +
+  ggtitle("UMAP tuned (n=80, min.dist=0.45, cosine)")
+p_by_clu <- DimPlot(obj.int, reduction = "umap", group.by = "seurat_clusters",
+                    label = TRUE, repel = TRUE, raster = TRUE)
+
+print(p_by_org); print(p_by_clu)
+
+saveRDS(obj.int, file.path(OUTDIR, "integrated_SCT_RPCA_baseline-postcluster.rds"))
+
+
+```
+
+```{r}
+# ==== CHUNK 6: Cx3cr1 expression by organ (violins + CSV) ====
+suppressPackageStartupMessages({
+  library(Seurat); library(dplyr); library(ggplot2); library(viridis); library(data.table)
+})
+
+BASE <- "D:/organs/mouse"
+RDS  <- file.path(BASE,"filtered", "rds", "seurat_post_qc.rds")
+OUTD <- file.path(BASE, "filtered","plots_new", "cx3cr1"); dir.create(OUTD, showWarnings = FALSE, recursive = TRUE)
+
+obj <- readRDS(RDS)
+stopifnot("organ" %in% colnames(obj@meta.data))
+DefaultAssay(obj) <- "RNA"
+
+suppressWarnings(try(obj <- JoinLayers(obj, assay = "RNA"), silent = TRUE))
+SeuratObject::DefaultLayer(obj[["RNA"]]) <- "counts"
+if (!"data" %in% SeuratObject::Layers(obj[["RNA"]])) {
+  obj <- NormalizeData(obj, normalization.method = "LogNormalize",
+                       scale.factor = 1e4, verbose = FALSE)
+}
+
+gene_query  <- "cx3cr1"
+genes_avail <- rownames(obj[["RNA"]])
+hit_idx     <- grep(paste0("^", gene_query, "$"), genes_avail, ignore.case = TRUE)
+stopifnot(length(hit_idx) > 0)
+gene_use <- genes_avail[hit_idx[1L]]
+message("Using gene: ", gene_use)
+
+E <- as.numeric(GetAssayData(obj, assay = "RNA", slot = "data")[gene_use, ])
+df <- data.frame(
+  organ = factor(obj$organ),
+  expr  = E,
+  det   = E > 0,
+  stringsAsFactors = FALSE
+)
+
+pct_tbl <- df %>%
+  group_by(organ) %>%
+  summarise(
+    n_cells = n(),
+    n_det   = sum(det),
+    pct_det = round(100 * n_det / n_cells, 1),
+    median_expr_det = round(median(expr[det], na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  arrange(organ)
+
+print(pct_tbl)
+data.table::fwrite(pct_tbl, file.path(OUTD, "cx3cr1_percent_expressing_by_organ.csv"))
+
+org_levels <- levels(df$organ)
+pal_org <- setNames(viridis::viridis(length(org_levels), option = "turbo"), org_levels)
+
+set.seed(1234)
+df_jit <- df %>%
+  dplyr::group_by(organ) %>%
+  dplyr::group_split() %>%
+  lapply(function(d) {
+    k <- min(nrow(d), 2000L)
+    d[sample.int(nrow(d), size = k, replace = FALSE), , drop = FALSE]
+  }) %>%
+  dplyr::bind_rows()
+
+p <- ggplot(df, aes(x = organ, y = expr, fill = organ)) +
+  geom_violin(width = 0.8, scale = "width", color = "grey35", linewidth = 0.3, trim = FALSE) +
+  stat_summary(fun = median, geom = "point", shape = 23, size = 2.2,
+               fill = "white", color = "black", stroke = 0.2) +
+  geom_point(
+    data = df_jit, aes(x = organ, y = expr),
+    position = position_jitter(width = 0.08, height = 0, seed = 1234),
+    alpha = 0.15, size = 0.4, color = "black", inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = pal_org, guide = "none") +
+  labs(
+    title = paste0(gene_use, " expression by organ (single-cell, log1p)"),
+    x = "Organ", y = paste0(gene_use, " (log1p normalized)")
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+print(p)
+
+
+```
+
+```{r}
+# ==== DROP-IN: Cx3cr1 detection table + expressing-only plots ====
+
+# 0) Setup (assumes obj already loaded)
+stopifnot("organ" %in% colnames(obj@meta.data))
+DefaultAssay(obj) <- "RNA"
+suppressWarnings(try(obj <- JoinLayers(obj, assay = "RNA"), silent = TRUE))
+if (!"data" %in% SeuratObject::Layers(obj[["RNA"]])) {
+  obj <- NormalizeData(obj, normalization.method = "LogNormalize",
+                       scale.factor = 1e4, verbose = FALSE)
+}
+
+# 1) Get expression vector + add to meta
+gene_query  <- "cx3cr1"
+genes_avail <- rownames(obj[["RNA"]])
+hit_idx     <- grep(paste0("^", gene_query, "$"), genes_avail, ignore.case = TRUE)
+stopifnot(length(hit_idx) > 0)
+gene_use <- genes_avail[hit_idx[1L]]
+
+expr_vec <- as.numeric(GetAssayData(obj, assay = "RNA", slot = "data")[gene_use, ])
+obj$Cx3cr1_expr <- expr_vec
+obj$Cx3cr1_det  <- factor(expr_vec > 0, levels = c(FALSE, TRUE), labels = c("No","Yes"))
+
+# 2) Per-organ detection/strength table
+library(dplyr)
+pct_tbl <- obj@meta.data %>%
+  transmute(organ = obj$organ,
+            expr  = Cx3cr1_expr,
+            det   = (Cx3cr1_det == "Yes")) %>%
+  group_by(organ) %>%
+  summarise(
+    n_cells          = n(),
+    n_det            = sum(det),
+    pct_det          = round(100 * n_det / n_cells, 1),
+    median_expr_det  = round(median(expr[det], na.rm = TRUE), 3),
+    mean_expr_det    = round(mean(expr[det],   na.rm = TRUE), 3),
+    median_expr_all  = round(median(expr,      na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  arrange(organ)
+
+print(pct_tbl)
+# data.table::fwrite(pct_tbl, "D:/organs/mouse/plots_new/cx3cr1/cx3cr1_percent_expressing_by_organ.csv")
+
+# 3) Expressing-only violin by organ (cleanest comparison)
+obj_expr <- subset(obj, cells = colnames(obj)[obj$Cx3cr1_det == "Yes"])
+p_expr_only <- VlnPlot(obj_expr, features = gene_use, group.by = "organ", pt.size = 0.1) +
+  ggtitle(paste0(gene_use, " — expressing cells only (log1p)"))
+print(p_expr_only)
+
+# 4) All cells but split by detection (optional)
+p_split_det <- VlnPlot(obj, features = gene_use, group.by = "organ", split.by = "Cx3cr1_det", pt.size = 0) +
+  ggtitle(paste0(gene_use, " — split by detection (Yes/No)"))
+print(p_split_det)
+
+# 5) Macrophage / microglia-only comparison (works if you have celltype annotation)
+if ("celltype" %in% colnames(obj@meta.data)) {
+  obj_mm <- subset(obj, subset = celltype %in% c("Macrophage","Microglia"))
+  p_mm <- VlnPlot(obj_mm, features = gene_use, group.by = "organ", pt.size = 0.1) +
+    ggtitle(paste0(gene_use, " — macrophage/microglia only"))
+  print(p_mm)
+} else {
+  message("No 'celltype' column found. If you want cluster-based subsetting, set Idents(obj) and do: ",
+          "VlnPlot(subset(obj, idents = c('Macrophage','Microglia')), features = '", gene_use, "', group.by = 'organ').")
+}
+
+
+
+```
+
+
+```{r}
+# ==== DROP-IN: classify ALL myeloid cells via mixture model (no fixed 20%) ====
+suppressPackageStartupMessages({
+  library(Seurat); library(dplyr); library(ggplot2); library(viridis); library(mclust)
+})
+
+# Reuse BASE / OUTD
+if (!exists("BASE")) BASE <- "D:/organs/mouse"
+OUTD <- file.path(BASE, "filtered","plots_new", "cx3cr1_myeloid"); dir.create(OUTD, recursive = TRUE, showWarnings = FALSE)
+
+DefaultAssay(obj) <- "RNA"
+
+# 0) Resolve gene (if needed)
+if (!exists("gene_use")) {
+  gene_query  <- "cx3cr1"
+  genes_avail <- rownames(obj[["RNA"]])
+  hit_idx     <- grep(paste0("^", gene_query, "$"), genes_avail, ignore.case = TRUE)
+  stopifnot(length(hit_idx) > 0)
+  gene_use <- genes_avail[hit_idx[1L]]
+}
+
+# 1) Myeloid module score (case-insensitive match)
+mk_myeloid_raw <- c("Adgre1","Lyz2","Csf1r","Cd68","Itgam","Ms4a7","Fcgr3","Tyrobp","Ctss","Mafb","Spi1")
+genes_avail <- rownames(obj[["RNA"]])
+map_case <- function(v){
+  hits <- sapply(v, function(g){ i <- which(tolower(genes_avail) == tolower(g)); if (length(i)) genes_avail[i[1]] else NA_character_ })
+  unique(na.omit(hits))
+}
+mk_myeloid <- map_case(mk_myeloid_raw)
+obj <- AddModuleScore(obj, features = list(mk_myeloid), name = "scoreMYL", assay = "RNA", search = FALSE)
+obj$score_myl <- obj$scoreMYL1
+
+# 2) Mixture model (G=2) on module score — classify myeloid “high-score” cells
+fit <- Mclust(obj$score_myl, G = 2, verbose = FALSE)
+comp_means <- fit$parameters$mean
+hi_comp    <- which.max(comp_means)                 # component with higher mean score
+post_hi    <- fit$z[, hi_comp]                      # posterior prob of being in high component
+p_cut      <- 0.70                                  # adjustable: 0.5 (looser) … 0.9 (stricter)
+obj$myeloid_flag <- post_hi >= p_cut
+
+message(sprintf("Classified myeloid cells: %d / %d (posterior ≥ %.2f)",
+                sum(obj$myeloid_flag), ncol(obj), p_cut))
+
+# 3) Subset ALL myeloid cells (by model), build per-organ table for Cx3cr1
+obj_myl <- subset(obj, cells = colnames(obj)[obj$myeloid_flag])
+
+E_m  <- as.numeric(GetAssayData(obj_myl, assay = "RNA", slot = "data")[gene_use, ])
+df_m <- data.frame(organ = factor(obj_myl$organ), expr = E_m, det = E_m > 0)
+
+sum_tbl_m <- df_m %>%
+  group_by(organ) %>%
+  summarise(
+    n_cells = n(),
+    pct_det = round(100 * mean(det), 1),
+    median_expr_det = round(median(expr[det], na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+
+# Order organs (choose: by % expressing or by median among positives)
+order_by <- "pct"   # "pct" or "median"
+organ_levels <- if (order_by == "pct") {
+  sum_tbl_m %>% arrange(desc(pct_det)) %>% pull(organ) %>% as.character()
+} else {
+  sum_tbl_m %>% arrange(desc(median_expr_det)) %>% pull(organ) %>% as.character()
+}
+sum_tbl_m$organ <- factor(sum_tbl_m$organ, levels = organ_levels)
+
+# 4) Compact bubble plot (legend on the RIGHT)
+p_myl <- ggplot(sum_tbl_m, aes(x = organ, y = 1, size = pct_det, color = median_expr_det)) +
+  geom_point() +
+  scale_size(range = c(2, 8), limits = c(0, 100), name = "% expressing") +
+  scale_color_viridis(option = "magma", name = "Median (log1p)") +
+  labs(
+    title = sprintf("Cx3cr1 — myeloid-classified (mixture posterior ≥ %.2f)", p_cut),
+    x = "Organ", y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "right",
+    legend.box = "vertical",
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(size = 10, face = "bold"),
+    axis.text.x = element_text(size = 9)
+  )
+print(p_myl)
+
+# Save bubble + table
+ggsave(file.path(OUTD, "Cx3cr1_myeloid_mixture_summary.png"), p_myl, width = 4, height = 4.0, dpi = 600)
+data.table::fwrite(sum_tbl_m, file.path(OUTD, "Cx3cr1_myeloid_mixture_summary_by_organ.csv"))
+
+# 5) Expressing-only violin with % labels + jittered dots (consistent order)
+df_m$organ <- factor(df_m$organ, levels = organ_levels)
+df_m_pos   <- df_m %>% filter(det) %>% mutate(organ = factor(organ, levels = organ_levels))
+pal <- setNames(viridis::viridis(length(organ_levels), option = "turbo"), organ_levels)
+
+# labels computed over ALL myeloid cells per organ
+lab_tbl <- df_m %>%
+  group_by(organ) %>%
+  summarise(
+    n_total = n(),
+    n_pos   = sum(det),
+    pct_pos = round(100 * n_pos / n_total, 1),
+    y_lab   = quantile(expr[det], 0.98, na.rm = TRUE),
+    .groups = "drop"
+  )
+lab_tbl$organ <- factor(lab_tbl$organ, levels = organ_levels)
+
+# downsample expressing cells for dots
+set.seed(1234)
+df_m_pos_jit <- df_m_pos %>%
+  group_by(organ) %>%
+  group_modify(~ .x[sample(seq_len(nrow(.x)),
+                           size = min(2000L, nrow(.x)),
+                           replace = FALSE), , drop = FALSE]) %>%
+  ungroup()
+
+p_myl_violin_dots <- ggplot(df_m_pos, aes(x = organ, y = expr, fill = organ)) +
+  geom_violin(width = 0.8, scale = "width", color = "grey35", linewidth = 0.3, trim = FALSE) +
+  geom_point(
+    data = df_m_pos_jit,
+    aes(x = organ, y = expr),
+    position = position_jitter(width = 0.08, height = 0, seed = 1234),
+    alpha = 0.15, size = 0.35, color = "black", inherit.aes = FALSE
+  ) +
+  stat_summary(fun = median, geom = "point", shape = 23, size = 2.0,
+               fill = "white", color = "black", stroke = 0.2) +
+  geom_text(data = lab_tbl,
+            aes(x = organ, y = y_lab, label = paste0(pct_pos, "%")),
+            vjust = -0.25, size = 3.1) +
+  scale_fill_manual(values = pal, guide = "none") +
+  labs(title = sprintf("%s — myeloid-classified (expressing only; %s order)",
+                       gene_use, ifelse(order_by=="pct", "% expressing", "median pos")),
+       x = "Organ", y = "log1p expression") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(size = 9),
+        plot.title = element_text(face = "bold", size = 10)) +
+  coord_cartesian(ylim = c(min(df_m_pos$expr, na.rm = TRUE),
+                           max(lab_tbl$y_lab, na.rm = TRUE) + 0.25))
+print(p_myl_violin_dots)
+
+ggsave(file.path(OUTD, "Cx3cr1_myeloid_mixture_violin_expressing_only_pct_dots.png"),
+       p_myl_violin_dots, width = 5.8, height = 2.6, dpi = 600)
+
+
+```
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
+
+
+
+
