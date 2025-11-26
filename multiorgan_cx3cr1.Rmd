@@ -532,7 +532,7 @@ if ("celltype" %in% colnames(obj@meta.data)) {
 
 
 ```{r}
-# ==== DROP-IN: classify ALL myeloid cells via mixture model (no fixed 20%) ====
+# classify ALL myeloid cells via mixture model (no fixed 20%) ====
 suppressPackageStartupMessages({
   library(Seurat); library(dplyr); library(ggplot2); library(viridis); library(mclust)
 })
@@ -721,6 +721,7 @@ ggsave(file.path(OUTD, "Cx3cr1_myeloid_mixture_violin_expressing_only_pct_dots.p
 
 
 ```
+
 
 
 
